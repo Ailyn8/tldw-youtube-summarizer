@@ -50,7 +50,6 @@ export default function Home() {
         padding: '50px 40px',
         boxShadow: '0 25px 80px rgba(0,0,0,0.35)'
       }}>
-        {/* Header */}
         <div style={{ textAlign: 'center', marginBottom: '35px' }}>
           <h1 style={{ 
             fontSize: '3rem', 
@@ -71,7 +70,6 @@ export default function Home() {
           </p>
         </div>
 
-        {/* Form */}
         <form onSubmit={handleSubmit}>
           <div style={{ marginBottom: '20px' }}>
             <input
@@ -86,11 +84,8 @@ export default function Home() {
                 border: '2px solid #e8e8e8',
                 borderRadius: '14px',
                 boxSizing: 'border-box',
-                transition: 'border-color 0.2s ease',
                 outline: 'none'
               }}
-              onFocus={(e) => e.target.style.borderColor = '#667eea'}
-              onBlur={(e) => e.target.style.borderColor = '#e8e8e8'}
             />
           </div>
           
@@ -108,33 +103,18 @@ export default function Home() {
                 : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
               border: 'none',
               borderRadius: '14px',
-              cursor: loading || !url.trim() ? 'not-allowed' : 'pointer',
-              transition: 'transform 0.2s ease, box-shadow 0.2s ease',
-              boxShadow: loading || !url.trim() 
-                ? 'none' 
-                : '0 4px 15px rgba(102, 126, 234, 0.4)'
-            }}
-            onMouseOver={(e) => {
-              if (!loading && url.trim()) {
-                e.target.style.transform = 'translateY(-2px)';
-                e.target.style.boxShadow = '0 6px 20px rgba(102, 126, 234, 0.5)';
-              }
-            }}
-            onMouseOut={(e) => {
-              e.target.style.transform = 'translateY(0)';
-              e.target.style.boxShadow = '0 4px 15px rgba(102, 126, 234, 0.4)';
+              cursor: loading || !url.trim() ? 'not-allowed' : 'pointer'
             }}
           >
             {loading ? '⏳ Summarizing... Please wait' : '✨ Summarize Video'}
           </button>
         </form>
 
-        {/* Error Message */}
         {error && (
           <div style={{
             marginTop: '25px',
             padding: '18px 22px',
-            background: 'linear-gradient(135deg, #fff5f5 0%, #fed7d7 100%)',
+            background: '#fff5f5',
             borderRadius: '14px',
             color: '#c53030',
             border: '1px solid #feb2b2'
@@ -143,12 +123,11 @@ export default function Home() {
           </div>
         )}
 
-        {/* Summary Result */}
         {summary && (
           <div style={{
             marginTop: '25px',
             padding: '25px',
-            background: 'linear-gradient(135deg, #f0fff4 0%, #c6f6d5 100%)',
+            background: '#f0fff4',
             borderRadius: '14px',
             border: '1px solid #9ae6b4'
           }}>
@@ -170,7 +149,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* Footer */}
         <p style={{ 
           textAlign: 'center', 
           marginTop: '30px', 
