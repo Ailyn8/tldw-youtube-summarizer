@@ -17,76 +17,55 @@ function extractVideoId(url) {
   return null;
 }
 
-async function getTranscript(videoId) {
-  // Fetch the video page to get caption tracks
-  const videoPageResponse = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-  });
+async function getTranscriptFromRapidAPI(videoId) {
+  const response = await fetch(
+    `https://youtube-transcriptor.p.rapidapi.com/transcript?video_id=${videoId}&lang=en`,
+    {
+      method: 'GET',
+      headers: {
+        'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
+        'X-RapidAPI-Host': 'youtube-transcriptor.p.rapidapi.com',
+      },
+    }
+  );
 
-  if (!videoPageResponse.ok) {
-    throw new Error('Failed to fetch video page');
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('RapidAPI error:', errorText);
+    throw new Error('Failed to fetch transcript');
   }
 
-  const html = await videoPageResponse.text();
-
-  // Extract captions URL from the page
-  const captionMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
-  if (!captionMatch) {
-    throw new Error('No captions available for this video');
-  }
-
-  let captionTracks;
-  try {
-    captionTracks = JSON.parse(captionMatch[1]);
-  } catch {
-    throw new Error('Failed to parse caption data');
-  }
-
-  if (!captionTracks || captionTracks.length === 0) {
-    throw new Error('No caption tracks found');
-  }
-
-  // Prefer English captions
-  let captionUrl = captionTracks.find(t => t.languageCode === 'en')?.baseUrl;
-  if (!captionUrl) {
-    captionUrl = captionTracks[0]?.baseUrl;
-  }
-
-  if (!captionUrl) {
-    throw new Error('No caption URL found');
-  }
-
-  // Fetch the captions XML
-  const captionResponse = await fetch(captionUrl);
-  if (!captionResponse.ok) {
-    throw new Error('Failed to fetch captions');
-  }
-
-  const captionXml = await captionResponse.text();
-
-  // Parse the XML to extract text
-  const textMatches = captionXml.matchAll(/<text[^>]*>(.*?)<\/text>/gs);
-  const texts = [];
+  const data = await response.json();
   
-  for (const match of textMatches) {
-    let text = match[1]
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/<[^>]*>/g, '')
-      .trim();
-    
-    if (text) {
-      texts.push(text);
+  // Handle different response formats
+  if (Array.isArray(data) && data.length > 0) {
+    // Format: [{ transcriptionAsText: "..." }] or [{ text: "..." }]
+    if (data[0].transcriptionAsText) {
+      return data[0].transcriptionAsText;
+    }
+    if (data[0].text) {
+      return data.map(item => item.text).join(' ');
+    }
+    // Format: array of transcript segments
+    if (data[0].subtitle) {
+      return data.map(item => item.subtitle).join(' ');
+    }
+  }
+  
+  if (data.transcription) {
+    return data.transcription;
+  }
+  
+  if (data.transcript) {
+    if (typeof data.transcript === 'string') {
+      return data.transcript;
+    }
+    if (Array.isArray(data.transcript)) {
+      return data.transcript.map(item => item.text || item.subtitle || '').join(' ');
     }
   }
 
-  return texts.join(' ');
+  throw new Error('Unexpected transcript format');
 }
 
 export async function POST(request) {
@@ -108,10 +87,18 @@ export async function POST(request) {
       );
     }
 
-    // Fetch transcript
+    // Check if RapidAPI key is configured
+    if (!process.env.RAPIDAPI_KEY) {
+      return Response.json(
+        { error: 'API not configured. Please add RAPIDAPI_KEY to environment variables.' }, 
+        { status: 500 }
+      );
+    }
+
+    // Fetch transcript using RapidAPI
     let transcript;
     try {
-      transcript = await getTranscript(videoId);
+      transcript = await getTranscriptFromRapidAPI(videoId);
     } catch (transcriptError) {
       console.error('Transcript error:', transcriptError.message);
       return Response.json(
@@ -137,6 +124,14 @@ export async function POST(request) {
     const truncatedTranscript = cleanedTranscript.length > maxLength 
       ? cleanedTranscript.slice(0, maxLength) + '...' 
       : cleanedTranscript;
+
+    // Check if Hugging Face key is configured
+    if (!process.env.HUGGINGFACE_API_KEY) {
+      return Response.json(
+        { error: 'AI not configured. Please add HUGGINGFACE_API_KEY to environment variables.' }, 
+        { status: 500 }
+      );
+    }
 
     // Create prompt for Hugging Face
     const prompt = `<s>[INST] You are a helpful assistant that creates concise summaries of YouTube videos.
