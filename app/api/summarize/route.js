@@ -1,4 +1,3 @@
-import { getSubtitles } from 'youtube-captions-scraper';
 import { HfInference } from '@huggingface/inference';
 
 const hf = new HfInference(process.env.HUGGINGFACE_API_KEY);
@@ -18,11 +17,82 @@ function extractVideoId(url) {
   return null;
 }
 
+async function getTranscript(videoId) {
+  // Fetch the video page to get caption tracks
+  const videoPageResponse = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  });
+
+  if (!videoPageResponse.ok) {
+    throw new Error('Failed to fetch video page');
+  }
+
+  const html = await videoPageResponse.text();
+
+  // Extract captions URL from the page
+  const captionMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
+  if (!captionMatch) {
+    throw new Error('No captions available for this video');
+  }
+
+  let captionTracks;
+  try {
+    captionTracks = JSON.parse(captionMatch[1]);
+  } catch {
+    throw new Error('Failed to parse caption data');
+  }
+
+  if (!captionTracks || captionTracks.length === 0) {
+    throw new Error('No caption tracks found');
+  }
+
+  // Prefer English captions
+  let captionUrl = captionTracks.find(t => t.languageCode === 'en')?.baseUrl;
+  if (!captionUrl) {
+    captionUrl = captionTracks[0]?.baseUrl;
+  }
+
+  if (!captionUrl) {
+    throw new Error('No caption URL found');
+  }
+
+  // Fetch the captions XML
+  const captionResponse = await fetch(captionUrl);
+  if (!captionResponse.ok) {
+    throw new Error('Failed to fetch captions');
+  }
+
+  const captionXml = await captionResponse.text();
+
+  // Parse the XML to extract text
+  const textMatches = captionXml.matchAll(/<text[^>]*>(.*?)<\/text>/gs);
+  const texts = [];
+  
+  for (const match of textMatches) {
+    let text = match[1]
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/<[^>]*>/g, '')
+      .trim();
+    
+    if (text) {
+      texts.push(text);
+    }
+  }
+
+  return texts.join(' ');
+}
+
 export async function POST(request) {
   try {
     const { url } = await request.json();
 
-    // Validate URL
     if (!url || typeof url !== 'string') {
       return Response.json(
         { error: 'Please provide a YouTube URL' }, 
@@ -30,7 +100,6 @@ export async function POST(request) {
       );
     }
 
-    // Extract video ID
     const videoId = extractVideoId(url.trim());
     if (!videoId) {
       return Response.json(
@@ -39,51 +108,31 @@ export async function POST(request) {
       );
     }
 
-    // Fetch transcript using youtube-captions-scraper
+    // Fetch transcript
     let transcript;
     try {
-      // Try English first, then auto-generated
-      let captions;
-      try {
-        captions = await getSubtitles({ videoID: videoId, lang: 'en' });
-      } catch {
-        // Try auto-generated English captions
-        try {
-          captions = await getSubtitles({ videoID: videoId, lang: 'en', type: 'auto' });
-        } catch {
-          // Try without specifying language
-          captions = await getSubtitles({ videoID: videoId });
-        }
-      }
-      
-      if (!captions || captions.length === 0) {
-        throw new Error('No captions found');
-      }
-      
-      transcript = captions.map(item => item.text).join(' ');
+      transcript = await getTranscript(videoId);
     } catch (transcriptError) {
-      console.error('Transcript error:', transcriptError);
+      console.error('Transcript error:', transcriptError.message);
       return Response.json(
-        { error: 'Could not get video transcript. The video may not have captions enabled, may be private, age-restricted, or the captions are disabled by the creator.' }, 
+        { error: 'Could not get video transcript. The video may not have captions enabled, or it may be private/age-restricted.' }, 
         { status: 400 }
       );
     }
 
-    // Validate transcript
     if (!transcript || transcript.length < 50) {
       return Response.json(
-        { error: 'Transcript is too short or empty. The video may not have enough spoken content.' }, 
+        { error: 'Transcript is too short or empty.' }, 
         { status: 400 }
       );
     }
 
-    // Clean transcript (remove [Music], [Applause], etc.)
+    // Clean and truncate transcript
     const cleanedTranscript = transcript
       .replace(/\[.*?\]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
 
-    // Truncate transcript for API limits
     const maxLength = 6000;
     const truncatedTranscript = cleanedTranscript.length > maxLength 
       ? cleanedTranscript.slice(0, maxLength) + '...' 
@@ -92,15 +141,14 @@ export async function POST(request) {
     // Create prompt for Hugging Face
     const prompt = `<s>[INST] You are a helpful assistant that creates concise summaries of YouTube videos.
 
-Your task: Summarize the following video transcript in 3-5 clear bullet points.
+Summarize the following video transcript in 3-5 clear bullet points:
 - Focus on the main ideas and key takeaways
 - Keep each point brief but informative
-- Use simple, easy-to-understand language
 
 Transcript:
 ${truncatedTranscript}
 
-Provide only the bullet point summary, nothing else. [/INST]`;
+Provide only the bullet point summary. [/INST]`;
 
     // Call Hugging Face API
     let response;
@@ -119,16 +167,12 @@ Provide only the bullet point summary, nothing else. [/INST]`;
     } catch (hfError) {
       console.error('Hugging Face error:', hfError);
       return Response.json(
-        { error: 'AI service temporarily unavailable. Please try again in a moment.' }, 
+        { error: 'AI service temporarily unavailable. Please try again.' }, 
         { status: 503 }
       );
     }
 
-    // Extract and clean summary
-    const summary = response.generated_text
-      .trim()
-      .replace(/^(Here'?s?|The|This|A) (is )?(a )?(summary|video|transcript)[:\s]*/i, '')
-      .trim();
+    const summary = response.generated_text?.trim();
 
     if (!summary) {
       return Response.json(
