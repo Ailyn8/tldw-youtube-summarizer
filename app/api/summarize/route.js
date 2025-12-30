@@ -13,7 +13,7 @@ function extractVideoId(url) {
   return null;
 }
 
-async function getTranscriptFromRapidAPI(videoId) {
+async function getTranscript(videoId) {
   const response = await fetch(
     `https://youtube-transcriptor.p.rapidapi.com/transcript?video_id=${videoId}&lang=en`,
     {
@@ -32,14 +32,9 @@ async function getTranscriptFromRapidAPI(videoId) {
   const data = await response.json();
   
   if (Array.isArray(data) && data.length > 0) {
-    if (data[0].transcriptionAsText) {
-      return data[0].transcriptionAsText;
-    }
-    if (data[0].text) {
-      return data.map(item => item.text).join(' ');
-    }
+    if (data[0].transcriptionAsText) return data[0].transcriptionAsText;
+    if (data[0].text) return data.map(item => item.text).join(' ');
   }
-  
   if (data.transcription) return data.transcription;
   if (data.transcript) {
     if (typeof data.transcript === 'string') return data.transcript;
@@ -51,47 +46,38 @@ async function getTranscriptFromRapidAPI(videoId) {
   throw new Error('No transcript found');
 }
 
-async function summarizeText(transcript, apiKey) {
-  // Using a summarization model directly (more reliable for this task)
-  const response = await fetch(
-    'https://api-inference.huggingface.co/models/facebook/bart-large-cnn',
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        inputs: transcript,
-        parameters: {
-          max_length: 300,
-          min_length: 50,
-          do_sample: false,
+async function summarizeWithGroq(transcript) {
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'llama-3.1-8b-instant',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant that summarizes YouTube videos. Create clear, concise summaries in bullet point format.'
         },
-        options: {
-          wait_for_model: true,
-        },
-      }),
-    }
-  );
+        {
+          role: 'user',
+          content: `Summarize this YouTube video transcript in 4-6 bullet points. Focus on the main ideas and key takeaways:\n\n${transcript}`
+        }
+      ],
+      temperature: 0.7,
+      max_tokens: 500,
+    }),
+  });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error('HF API error:', response.status, errorText);
-    throw new Error(`Hugging Face API error: ${response.status}`);
+    const errorData = await response.text();
+    console.error('Groq API error:', response.status, errorData);
+    throw new Error(`Groq API error: ${response.status}`);
   }
 
-  const result = await response.json();
-  
-  if (Array.isArray(result) && result[0]?.summary_text) {
-    return result[0].summary_text;
-  }
-  
-  if (result.summary_text) {
-    return result.summary_text;
-  }
-
-  throw new Error('Unexpected response format');
+  const data = await response.json();
+  return data.choices[0]?.message?.content || '';
 }
 
 export async function POST(request) {
@@ -99,82 +85,65 @@ export async function POST(request) {
     const { url } = await request.json();
 
     if (!url || typeof url !== 'string') {
-      return Response.json(
-        { error: 'Please provide a YouTube URL' }, 
-        { status: 400 }
-      );
+      return Response.json({ error: 'Please provide a YouTube URL' }, { status: 400 });
     }
 
     const videoId = extractVideoId(url.trim());
     if (!videoId) {
-      return Response.json(
-        { error: 'Invalid YouTube URL.' }, 
-        { status: 400 }
-      );
+      return Response.json({ error: 'Invalid YouTube URL.' }, { status: 400 });
     }
 
+    // Check API keys
     if (!process.env.RAPIDAPI_KEY) {
-      return Response.json(
-        { error: 'RAPIDAPI_KEY not configured.' }, 
-        { status: 500 }
-      );
+      return Response.json({ error: 'RAPIDAPI_KEY not configured.' }, { status: 500 });
     }
-
-    if (!process.env.HUGGINGFACE_API_KEY) {
-      return Response.json(
-        { error: 'HUGGINGFACE_API_KEY not configured.' }, 
-        { status: 500 }
-      );
+    if (!process.env.GROQ_API_KEY) {
+      return Response.json({ error: 'GROQ_API_KEY not configured.' }, { status: 500 });
     }
 
     // Get transcript
     let transcript;
     try {
-      transcript = await getTranscriptFromRapidAPI(videoId);
+      transcript = await getTranscript(videoId);
     } catch (err) {
+      console.error('Transcript error:', err);
       return Response.json(
-        { error: 'Could not get transcript. Video may not have captions.' }, 
+        { error: 'Could not get transcript. Video may not have captions enabled.' }, 
         { status: 400 }
       );
     }
 
     if (!transcript || transcript.length < 50) {
-      return Response.json(
-        { error: 'Transcript too short.' }, 
-        { status: 400 }
-      );
+      return Response.json({ error: 'Transcript too short or empty.' }, { status: 400 });
     }
 
-    // Clean and limit transcript (BART model has 1024 token limit)
+    // Clean and limit transcript
     const cleanedTranscript = transcript
       .replace(/\[.*?\]/g, '')
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 3000);
+      .slice(0, 8000);
 
-    // Summarize
+    // Summarize with Groq
     let summary;
     try {
-      summary = await summarizeText(cleanedTranscript, process.env.HUGGINGFACE_API_KEY);
+      summary = await summarizeWithGroq(cleanedTranscript);
     } catch (err) {
-      console.error('Summarization error:', err.message);
+      console.error('Groq error:', err);
       return Response.json(
-        { error: 'AI summarization failed. Please try again in a moment.' }, 
+        { error: 'AI summarization failed. Please try again.' }, 
         { status: 503 }
       );
     }
 
-    // Format as bullet points
-    const sentences = summary.split(/(?<=[.!?])\s+/).filter(s => s.trim());
-    const bulletPoints = sentences.map(s => `• ${s.trim()}`).join('\n');
+    if (!summary) {
+      return Response.json({ error: 'Failed to generate summary.' }, { status: 500 });
+    }
 
-    return Response.json({ summary: bulletPoints });
+    return Response.json({ summary });
 
   } catch (error) {
-    console.error('Error:', error);
-    return Response.json(
-      { error: 'An unexpected error occurred.' },
-      { status: 500 }
-    );
+    console.error('Unexpected error:', error);
+    return Response.json({ error: 'An unexpected error occurred.' }, { status: 500 });
   }
 }
