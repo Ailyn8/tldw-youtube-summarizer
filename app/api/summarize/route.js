@@ -1,4 +1,4 @@
-import { YoutubeTranscript } from 'youtube-transcript';
+import { getSubtitles } from 'youtube-captions-scraper';
 import { HfInference } from '@huggingface/inference';
 
 const hf = new HfInference(process.env.HUGGINGFACE_API_KEY);
@@ -39,15 +39,32 @@ export async function POST(request) {
       );
     }
 
-    // Fetch transcript
+    // Fetch transcript using youtube-captions-scraper
     let transcript;
     try {
-      const transcriptItems = await YoutubeTranscript.fetchTranscript(videoId);
-      transcript = transcriptItems.map(item => item.text).join(' ');
+      // Try English first, then auto-generated
+      let captions;
+      try {
+        captions = await getSubtitles({ videoID: videoId, lang: 'en' });
+      } catch {
+        // Try auto-generated English captions
+        try {
+          captions = await getSubtitles({ videoID: videoId, lang: 'en', type: 'auto' });
+        } catch {
+          // Try without specifying language
+          captions = await getSubtitles({ videoID: videoId });
+        }
+      }
+      
+      if (!captions || captions.length === 0) {
+        throw new Error('No captions found');
+      }
+      
+      transcript = captions.map(item => item.text).join(' ');
     } catch (transcriptError) {
       console.error('Transcript error:', transcriptError);
       return Response.json(
-        { error: 'Could not get video transcript. The video may not have captions enabled, or it may be private/age-restricted.' }, 
+        { error: 'Could not get video transcript. The video may not have captions enabled, may be private, age-restricted, or the captions are disabled by the creator.' }, 
         { status: 400 }
       );
     }
@@ -60,11 +77,17 @@ export async function POST(request) {
       );
     }
 
+    // Clean transcript (remove [Music], [Applause], etc.)
+    const cleanedTranscript = transcript
+      .replace(/\[.*?\]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     // Truncate transcript for API limits
     const maxLength = 6000;
-    const truncatedTranscript = transcript.length > maxLength 
-      ? transcript.slice(0, maxLength) + '...' 
-      : transcript;
+    const truncatedTranscript = cleanedTranscript.length > maxLength 
+      ? cleanedTranscript.slice(0, maxLength) + '...' 
+      : cleanedTranscript;
 
     // Create prompt for Hugging Face
     const prompt = `<s>[INST] You are a helpful assistant that creates concise summaries of YouTube videos.
