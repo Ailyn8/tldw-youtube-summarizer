@@ -1,7 +1,3 @@
-import { HfInference } from '@huggingface/inference';
-
-const hf = new HfInference(process.env.HUGGINGFACE_API_KEY);
-
 function extractVideoId(url) {
   const patterns = [
     /(?:youtube\.com\/watch\?v=)([^&\n?#]+)/,
@@ -30,42 +26,72 @@ async function getTranscriptFromRapidAPI(videoId) {
   );
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error('RapidAPI error:', errorText);
     throw new Error('Failed to fetch transcript');
   }
 
   const data = await response.json();
   
-  // Handle different response formats
   if (Array.isArray(data) && data.length > 0) {
-    // Format: [{ transcriptionAsText: "..." }] or [{ text: "..." }]
     if (data[0].transcriptionAsText) {
       return data[0].transcriptionAsText;
     }
     if (data[0].text) {
       return data.map(item => item.text).join(' ');
     }
-    // Format: array of transcript segments
-    if (data[0].subtitle) {
-      return data.map(item => item.subtitle).join(' ');
-    }
   }
   
-  if (data.transcription) {
-    return data.transcription;
-  }
-  
+  if (data.transcription) return data.transcription;
   if (data.transcript) {
-    if (typeof data.transcript === 'string') {
-      return data.transcript;
-    }
+    if (typeof data.transcript === 'string') return data.transcript;
     if (Array.isArray(data.transcript)) {
-      return data.transcript.map(item => item.text || item.subtitle || '').join(' ');
+      return data.transcript.map(item => item.text || '').join(' ');
     }
   }
 
-  throw new Error('Unexpected transcript format');
+  throw new Error('No transcript found');
+}
+
+async function summarizeText(transcript, apiKey) {
+  // Using a summarization model directly (more reliable for this task)
+  const response = await fetch(
+    'https://api-inference.huggingface.co/models/facebook/bart-large-cnn',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        inputs: transcript,
+        parameters: {
+          max_length: 300,
+          min_length: 50,
+          do_sample: false,
+        },
+        options: {
+          wait_for_model: true,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('HF API error:', response.status, errorText);
+    throw new Error(`Hugging Face API error: ${response.status}`);
+  }
+
+  const result = await response.json();
+  
+  if (Array.isArray(result) && result[0]?.summary_text) {
+    return result[0].summary_text;
+  }
+  
+  if (result.summary_text) {
+    return result.summary_text;
+  }
+
+  throw new Error('Unexpected response format');
 }
 
 export async function POST(request) {
@@ -82,106 +108,72 @@ export async function POST(request) {
     const videoId = extractVideoId(url.trim());
     if (!videoId) {
       return Response.json(
-        { error: 'Invalid YouTube URL. Please use a valid YouTube link.' }, 
+        { error: 'Invalid YouTube URL.' }, 
         { status: 400 }
       );
     }
 
-    // Check if RapidAPI key is configured
     if (!process.env.RAPIDAPI_KEY) {
       return Response.json(
-        { error: 'API not configured. Please add RAPIDAPI_KEY to environment variables.' }, 
+        { error: 'RAPIDAPI_KEY not configured.' }, 
         { status: 500 }
       );
     }
 
-    // Fetch transcript using RapidAPI
+    if (!process.env.HUGGINGFACE_API_KEY) {
+      return Response.json(
+        { error: 'HUGGINGFACE_API_KEY not configured.' }, 
+        { status: 500 }
+      );
+    }
+
+    // Get transcript
     let transcript;
     try {
       transcript = await getTranscriptFromRapidAPI(videoId);
-    } catch (transcriptError) {
-      console.error('Transcript error:', transcriptError.message);
+    } catch (err) {
       return Response.json(
-        { error: 'Could not get video transcript. The video may not have captions enabled, or it may be private/age-restricted.' }, 
+        { error: 'Could not get transcript. Video may not have captions.' }, 
         { status: 400 }
       );
     }
 
     if (!transcript || transcript.length < 50) {
       return Response.json(
-        { error: 'Transcript is too short or empty.' }, 
+        { error: 'Transcript too short.' }, 
         { status: 400 }
       );
     }
 
-    // Clean and truncate transcript
+    // Clean and limit transcript (BART model has 1024 token limit)
     const cleanedTranscript = transcript
       .replace(/\[.*?\]/g, '')
       .replace(/\s+/g, ' ')
-      .trim();
+      .trim()
+      .slice(0, 3000);
 
-    const maxLength = 6000;
-    const truncatedTranscript = cleanedTranscript.length > maxLength 
-      ? cleanedTranscript.slice(0, maxLength) + '...' 
-      : cleanedTranscript;
-
-    // Check if Hugging Face key is configured
-    if (!process.env.HUGGINGFACE_API_KEY) {
-      return Response.json(
-        { error: 'AI not configured. Please add HUGGINGFACE_API_KEY to environment variables.' }, 
-        { status: 500 }
-      );
-    }
-
-    // Create prompt for Hugging Face
-    const prompt = `<s>[INST] You are a helpful assistant that creates concise summaries of YouTube videos.
-
-Summarize the following video transcript in 3-5 clear bullet points:
-- Focus on the main ideas and key takeaways
-- Keep each point brief but informative
-
-Transcript:
-${truncatedTranscript}
-
-Provide only the bullet point summary. [/INST]`;
-
-    // Call Hugging Face API
-    let response;
+    // Summarize
+    let summary;
     try {
-      response = await hf.textGeneration({
-        model: 'mistralai/Mistral-7B-Instruct-v0.2',
-        inputs: prompt,
-        parameters: {
-          max_new_tokens: 500,
-          temperature: 0.7,
-          top_p: 0.95,
-          return_full_text: false,
-          do_sample: true,
-        },
-      });
-    } catch (hfError) {
-      console.error('Hugging Face error:', hfError);
+      summary = await summarizeText(cleanedTranscript, process.env.HUGGINGFACE_API_KEY);
+    } catch (err) {
+      console.error('Summarization error:', err.message);
       return Response.json(
-        { error: 'AI service temporarily unavailable. Please try again.' }, 
+        { error: 'AI summarization failed. Please try again in a moment.' }, 
         { status: 503 }
       );
     }
 
-    const summary = response.generated_text?.trim();
+    // Format as bullet points
+    const sentences = summary.split(/(?<=[.!?])\s+/).filter(s => s.trim());
+    const bulletPoints = sentences.map(s => `• ${s.trim()}`).join('\n');
 
-    if (!summary) {
-      return Response.json(
-        { error: 'Failed to generate summary. Please try again.' }, 
-        { status: 500 }
-      );
-    }
-
-    return Response.json({ summary });
+    return Response.json({ summary: bulletPoints });
 
   } catch (error) {
-    console.error('Unexpected error:', error);
+    console.error('Error:', error);
     return Response.json(
-      { error: 'An unexpected error occurred. Please try again.' },
+      { error: 'An unexpected error occurred.' },
       { status: 500 }
     );
   }
